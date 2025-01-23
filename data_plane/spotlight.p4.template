@@ -1,0 +1,416 @@
+/* -*- P4_16 -*- */
+
+#include <core.p4>
+#include <tna.p4>
+
+#include "headers.p4"
+#include "parser.p4"
+
+#define COMPARE_SIZE {{compare_size}}
+#define CACHE_SIZE {{cache_size}}
+#define REPORT_FLOW_DIGEST 0
+#define MAP_SIZE 100000
+#define INTERNAL_SIZE 80000
+
+#define REPORT_PORT 140 //Change to correct physical port for your system
+
+#define START_TIME ig_intr_md.ingress_mac_tstamp[41:10]
+
+typedef bit<32> size_t;
+typedef bit<16> compare_index_t;
+
+
+/*************************************************************************
+ **************  I N G R E S S   P R O C E S S I N G   *******************
+ *************************************************************************/
+
+
+control Ingress(
+    /* User */
+    inout ingress_headers_t                       hdr,
+    inout ingress_metadata_t                      meta,
+    /* Intrinsic */
+    in    ingress_intrinsic_metadata_t               ig_intr_md,
+    in    ingress_intrinsic_metadata_from_parser_t   ig_prsr_md,
+    inout ingress_intrinsic_metadata_for_deparser_t  ig_dprsr_md,
+    inout ingress_intrinsic_metadata_for_tm_t        ig_tm_md)
+{
+    
+    @symmetric("hdr.ipv4.src_addr", "hdr.ipv4.dst_addr")
+    @symmetric("hdr.l4_ports.src_port", "hdr.l4_ports.dst_port")
+    Hash<bit<32>>(HashAlgorithm_t.CRC32) flow_id_hash;
+
+    @symmetric("hdr.ipv4.src_addr", "hdr.ipv4.dst_addr")
+    @symmetric("hdr.l4_ports.src_port", "hdr.l4_ports.dst_port")
+    Hash<cache_index_t>(HashAlgorithm_t.CRC16) flow_idx_hash;
+
+    action do_flow_id_hash() {
+        meta.flow_stats.flow_id = flow_id_hash.get({
+                                hdr.ipv4.src_addr,
+                                hdr.ipv4.dst_addr,
+                                hdr.ipv4.protocol,
+                                hdr.l4_ports.src_port,
+                                hdr.l4_ports.dst_port
+                            });
+    }
+
+    action do_flow_idx_hash() {
+        meta.flow_stats.flow_idx = flow_idx_hash.get({
+                                hdr.ipv4.src_addr,
+                                hdr.ipv4.dst_addr,
+                                hdr.ipv4.protocol,
+                                hdr.l4_ports.src_port,
+                                hdr.l4_ports.dst_port
+                            });
+    }
+
+    size_t update_size; //Holds evicted bytes and moves to comparison storage
+    bit<8> update_reg; //Register array to update
+    bit<3> cache_state = 0; //Record cache state based on map hit and ID matching
+    
+    {% for r in range(registers) %}
+    compare_index_t compare_idx_{{r}} = 0; 
+    size_t size_{{r}} = 0; 
+    Register<size_t, compare_index_t>(COMPARE_SIZE) compare_reg_{{r}}; 
+    RegisterAction<size_t, compare_index_t, size_t>(compare_reg_{{r}}) compare_reg_action_{{r}} = { 
+        void apply (inout size_t value, out size_t rv) { 
+            size_t in_value = value; 
+            if(update_reg == {{r}}) {  
+                value = in_value + update_size;
+            } 
+            rv = value; 
+        } 
+    };
+    {% endfor %}
+
+    Counter<bit<32>, bit<3>>(8, CounterType_t.PACKETS) digest_counter;
+
+    action report_pivot() {
+        ig_tm_md.ucast_egress_port = REPORT_PORT; 
+    }
+
+
+    {% for r in range(registers - 1) %}
+    size_t size_diff_{{r}};
+    {% endfor %}
+
+    table compare_size {
+        key = {
+            {% for r in range(registers - 1) %}
+            size_diff_{{r}} : ternary;
+            {% endfor %}
+            meta.map_hit : exact;
+        }
+        actions = {
+            report_pivot;
+        }
+    }
+
+    action set_indexes(
+        {% for r in range(registers) %}
+        compare_index_t reg_idx_{{r}},
+        {% endfor %}
+        bit<8> update_idx) {
+        {% for r in range(registers) %}
+        compare_idx_{{r}} = reg_idx_{{r}};
+        {% endfor %}
+
+        update_reg = update_idx;
+        cache_state = 1; 
+        meta.map_hit = 1;
+    }
+    
+    @idletime_precision(1)
+    table outgoing_map {
+        key = {
+            meta.flow_stats.flow_id : exact;
+            meta.flow_stats.flow_idx : exact;
+        }
+        actions = {
+            set_indexes;
+        }
+        size = MAP_SIZE;
+        idle_timeout = true;
+    }
+
+    {% for i in range(registers) %}
+    action set_index_{{i}}(compare_index_t reg_idx, bit<8> update_idx) {
+        compare_idx_{{i}} = reg_idx;
+        cache_state = 1;
+        update_reg = update_idx;
+    }
+    {% endfor %}
+    
+    @idletime_precision(1)
+    table incoming_map {
+        key = {
+            meta.flow_stats.flow_id : exact;
+            meta.flow_stats.flow_idx : exact;
+        }
+        actions = {
+            {% for i in range(registers) %}
+            set_index_{{i}};
+            {% endfor %}
+        }
+        size = MAP_SIZE;
+        idle_timeout = true;
+    }
+
+    //Register to store flow ID
+    //Set or reset depending on cache state (map hit)
+    Register<bit<32>, cache_index_t>(CACHE_SIZE) flow_id_reg;
+    RegisterAction<bit<32>, cache_index_t, bit<32>>(flow_id_reg) check_flow_id = {
+        void apply (inout bit<32> value, out bit<32> rv) {
+            bit<32> in_value = value;
+            if (cache_state == 0){
+                value = meta.flow_stats.flow_id;
+            }
+            else {
+                value = 0;
+            }
+	    rv = in_value;
+        }
+    };
+    
+    //Register to store flow start time
+    //Reset depending on cache state
+    Register<bit<32>, cache_index_t>(CACHE_SIZE) flow_time_reg;
+    RegisterAction<bit<32>, cache_index_t, bit<32>>(flow_time_reg) get_evict_time = {
+        void apply (inout bit<32> value, out bit<32> rv) {
+            bit<32> in_value = value;
+
+            if (cache_state == 0) {
+                value = START_TIME;
+            }
+
+            rv = in_value;
+        }
+    };
+    
+    //Register to store flow bytes
+    //Increment, reset, or evict depending on cache state
+    Register<bit<32>, cache_index_t>(CACHE_SIZE) flow_bytes_reg;
+    RegisterAction<bit<32>, cache_index_t, bit<32>>(flow_bytes_reg) get_bytes = {
+        void apply (inout bit<32> value, out bit<32> rv) {
+            bit<32> in_value = value;
+            if (cache_state > 1) {
+                value = in_value + (bit<32>) hdr.ipv4.total_len;
+                rv = value;
+            }
+            else if (cache_state > 0) {
+                rv = 0;
+            }
+            else {
+                value = (bit<32>) hdr.ipv4.total_len;
+                rv = value;
+            }
+
+        }
+    };
+    
+
+    action set_internal() {
+        ig_dprsr_md.digest_type = cache_state;
+    }
+    action set_external() {
+        ig_dprsr_md.digest_type = 1;
+    }
+
+
+    //TABLEs to hold internal ndoes
+    table internal_src_ip {
+        key = {
+            hdr.ipv4.src_addr : exact;
+        }
+        actions = {
+            set_internal;
+            set_external;
+        }
+        default_action = set_external;
+        size = INTERNAL_SIZE;
+    }
+    table internal_dst_ip {
+        key = {
+            hdr.ipv4.dst_addr : exact;
+        }
+        actions = {
+            set_internal;
+            set_external;
+        }
+        default_action = set_external;
+        size = INTERNAL_SIZE;
+    }
+
+    apply {
+        
+        if (hdr.ipv4.isValid()) {
+            if(hdr.l4_ports.isValid()){
+                //hash
+                do_flow_id_hash();
+                do_flow_idx_hash();
+                meta.flow_stats.start_time = get_start_time.execute(0);
+                
+
+                //check map
+                incoming_map.apply();
+                outgoing_map.apply();
+            
+
+                //check ID agains cache
+                meta.flow_stats.evict_flow_id = check_flow_id.execute(meta.flow_stats.flow_idx);
+                
+
+                //update or evict cache as needed
+                if (meta.flow_stats.evict_flow_id == meta.flow_stats.flow_id) {
+                    cache_state = cache_state + 2;
+                }
+
+                bit<32> cache_evict = get_bytes.execute(meta.flow_stats.flow_idx);
+                meta.flow_stats.evict_time = get_evict_time.execute(meta.flow_stats.flow_idx);
+                
+                if (cache_evict == 0) {
+                    update_size = (bit<32>) hdr.ipv4.total_len;
+                }
+                else {
+                    update_size = cache_evict;
+                }
+                
+                //access storage
+                {% for r in range(registers) %}
+                size_{{r}} = compare_reg_action_{{r}}.execute(compare_idx_{{r}});
+                {% endfor %}
+
+                {% for r in range(registers) %}
+                {% endfor %}
+
+
+                //compute size diffs
+                {% for r in range(registers) %}
+                {% if loop.first %}
+                if (update_reg == {{r}}) {
+                {% else %}
+                else if (update_reg == {{r}}) {
+                {% endif %}
+                {% for c in range(registers) if not c == r %}
+                    {% if c < r %}
+                    size_diff_{{size_fields[r][c] - 1}} = size_{{r}} - size_{{c}};
+                    {% else %}
+                    size_diff_{{size_fields[r][c] - 1}} = size_{{c}} - size_{{r}};
+                    {% endif %}
+                {% endfor %}
+                }
+                {% endfor %}
+
+                //Report if compare size is a hit and one internal table
+                compare_size.apply();    
+                if(!internal_src_ip.apply().hit){
+                    internal_dst_ip.apply();
+                }
+
+                digest_counter.count(ig_dprsr_md.digest_type);
+            }
+        }
+    }
+}
+
+    /*********************  D E P A R S E R  ************************/
+
+control IngressDeparser(packet_out pkt,
+    /* User */
+    inout ingress_headers_t                       hdr,
+    in    ingress_metadata_t                      meta,
+    /* Intrinsic */
+    in    ingress_intrinsic_metadata_for_deparser_t  ig_dprsr_md)
+{
+
+    Digest <flow_report_h>() report_flow;
+
+    apply {
+        if (ig_dprsr_md.digest_type == REPORT_FLOW_DIGEST) {
+            report_flow.pack({
+                    meta.flow_stats.flow_id,
+                    meta.flow_stats.flow_idx,
+                    meta.flow_stats.start_time,
+                    hdr.ipv4.src_addr,
+                    hdr.ipv4.dst_addr,
+                    meta.flow_stats.evict_flow_id,
+                    meta.flow_stats.evict_time
+                    });
+        }
+        pkt.emit(hdr);
+    }
+}
+
+
+/*************************************************************************
+ ****************  E G R E S S   P R O C E S S I N G   *******************
+ *************************************************************************/
+
+    /***********************  H E A D E R S  ************************/
+
+struct egress_headers_t {
+}
+
+    /********  G L O B A L   E G R E S S   M E T A D A T A  *********/
+
+struct egress_metadata_t {
+}
+
+    /***********************  P A R S E R  **************************/
+
+parser EgressParser(packet_in        pkt,
+    /* User */
+    out egress_headers_t          hdr,
+    out egress_metadata_t         meta,
+    /* Intrinsic */
+    out egress_intrinsic_metadata_t  eg_intr_md)
+{
+    /* This is a mandatory state, required by Tofino Architecture */
+    state start {
+        pkt.extract(eg_intr_md);
+        transition accept;
+    }
+}
+
+    /***************** M A T C H - A C T I O N  *********************/
+
+control Egress(
+    /* User */
+    inout egress_headers_t                          hdr,
+    inout egress_metadata_t                         meta,
+    /* Intrinsic */
+    in    egress_intrinsic_metadata_t                  eg_intr_md,
+    in    egress_intrinsic_metadata_from_parser_t      eg_prsr_md,
+    inout egress_intrinsic_metadata_for_deparser_t     eg_dprsr_md,
+    inout egress_intrinsic_metadata_for_output_port_t  eg_oport_md)
+{
+    apply {
+    }
+}
+
+    /*********************  D E P A R S E R  ************************/
+
+control EgressDeparser(packet_out pkt,
+    /* User */
+    inout egress_headers_t                       hdr,
+    in    egress_metadata_t                      meta,
+    /* Intrinsic */
+    in    egress_intrinsic_metadata_for_deparser_t  eg_dprsr_md)
+{
+    apply {
+        pkt.emit(hdr);
+    }
+}
+
+
+/************ F I N A L   P A C K A G E ******************************/
+Pipeline(
+    IngressParser(),
+    Ingress(),
+    IngressDeparser(),
+    EgressParser(),
+    Egress(),
+    EgressDeparser()
+) pipe;
+
+Switch(pipe) main;

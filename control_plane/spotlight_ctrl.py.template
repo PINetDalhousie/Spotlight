@@ -1,0 +1,386 @@
+from sortedcontainers import SortedDict
+import time as timeM
+import threading
+import ipaddress
+import logging
+import datetime
+import struct
+import queue
+
+INTERNAL_HOSTS_FILE="internal.hosts"
+
+POLL_STATUS = True
+#Note: Register arrays 0 and 1 were found to be unreliable during testing
+BLOCK_REGISTERS = [0,1] #Registers to block from allocation
+
+NUM_REGISTERS = {{registers}}
+
+SET_INITIAL = True
+INITIAL_SIZE = 2**(32 - NUM_REGISTERS)
+
+report_queue = queue.Queue()
+
+#initial setup
+print("Starting setup...")
+
+logfile = f"map_errors.log"
+logging.basicConfig(filename=logfile, level=logging.ERROR)
+
+
+INDEX_TIMEOUT = {{index_timeout}}
+COMPARE_CAPACITY = {{compare_size}}
+TIME_WINDOW = {{time_threshold}} >> 10
+IDLE_TIME = int(INDEX_TIMEOUT / 1e9)
+
+compare_regs = {i: 1 for i in range(NUM_REGISTERS)}
+
+batch_lock = threading.Lock()
+batch_count = 0
+
+#flow_id: idx,reg, time
+flow_id_idx = {}
+
+
+nodes_incoming = {}
+nodes_outgoing = {}
+mapping = {}
+
+incomplete_records = {}
+
+errors = {"allocation" : 0, "match_num" : 0}
+
+
+#Allocate each flow to a register
+def allocate_flows(match_ids, trigger_id): #int, [ints]
+    global flow_id_idx, compare_regs, errors
+    reg_used = set()
+    ids_used = set()
+
+    #Block unreliable registers
+    if(len(BLOCK_REGISTERS) > 0):
+        for reg in BLOCK_REGISTERS:
+            reg_used.add(reg)
+
+    allocation = {}
+    #1. Get indexes for existing flows
+    #2. Exclude these registers from allowcation
+    for id in match_ids:
+        if id in flow_id_idx:
+            if (timeM.monotonic_ns() - flow_id_idx[id]['time']) < INDEX_TIMEOUT: #Check if flow is old
+                if flow_id_idx[id]['reg'] in reg_used:
+                    logging.error(f"Allocation: Flow id {id} register in use. Trigger {trigger_id}")
+                    errors["allocation"] = errors["allocation"] + 1
+                else:
+                    reg_used.add(flow_id_idx[id]['reg'])
+                    ids_used.add(id)
+                    allocation[flow_id_idx[id]['reg']] = flow_id_idx[id]['idx']
+                    
+    allocatable_ids = [x for x in match_ids if x not in ids_used]
+    
+    #3. Allocate remaining indexs. Allocate to least used registers in order
+    allocatable_regs = [x for x in compare_regs.items() if x[0] not in reg_used]
+    allocatable_regs.sort(key=lambda x:x[1])
+
+    new_ids = []
+    for id, reg in zip(allocatable_ids, allocatable_regs):
+        flow_id_idx[id] = {'reg':reg[0], 'idx':reg[1]%COMPARE_CAPACITY, 'time':timeM.monotonic_ns()}
+        allocation[reg[0]] = reg[1]%COMPARE_CAPACITY
+
+        compare_regs[reg[0]] += 1
+        if compare_regs[reg[0]]%COMPARE_CAPACITY == 0:
+            compare_regs[reg[0]] += 1
+        new_ids.append(id)
+        
+
+    
+    return allocation, new_ids.
+    
+def add_outgoing_flow(node, flow_id, time):
+    global nodes_incoming, nodes_outgoing, mapping, errors, batch_count, batch_lock
+
+    #Recording the mapping
+    if node not in nodes_outgoing:
+        nodes_outgoing[node] = SortedDict()
+    nodes_outgoing[node].update({time :  flow_id})
+
+    #find incoming flows within time threshold
+    start_time_range = time - TIME_WINDOW
+
+    if node not in nodes_incoming:
+        return
+    
+    timespan = nodes_incoming[node]
+
+    #Check how many OOB
+    match_flows = list(timespan.irange(start_time_range, time))
+    if len(match_flows) < 1:
+        return
+
+    if len(match_flows) > NUM_REGISTERS:
+        errors["match_num"] = errors["match_num"] + 1
+        logging.error(f"Too many matches, Flow ID: {flow_id}")
+    
+    
+    match_flows = match_flows[1-NUM_REGISTERS + len(BLOCK_REGISTERS):]
+    match_ids = {timespan[flow] for flow in match_flows}
+
+    #Check if we need to update the mapping
+    if flow_id not in mapping:
+        mapping[flow_id] = set(match_ids)
+    elif(mapping[flow_id] == set(match_ids)):
+        return
+    else:
+        mapping[flow_id] = set(match_ids)
+
+
+    #Allocate the flows to registers
+    match_ids.add(flow_id)
+    flow_allocation, new_flows = allocate_flows(match_ids, flow_id)
+    
+
+    #Create entries
+    table = bfrt.{{prog_name}}.pipe.Ingress.outgoing_map
+    try:
+        table.entry_with_set_indexes(
+            flow_id = (flow_id & 0xFFFFFFFF0000) >> 16,
+            flow_idx = (flow_id & 0xFFFF),
+            {% for i in range(registers) %}
+            reg_idx_{{i}} = flow_allocation[{{i}}] if {{i}} in flow_allocation else 0,
+            {% endfor %}
+            update_idx = flow_id_idx[flow_id]['reg'],
+            ENTRY_HIT_STATE="ENTRY_ACTIVE"
+        ).push()
+    except Exception as e:
+        print("Outgoing Map Add Error: ", e)
+        logging.error(f"Outgoing Map Add Error: {e}")
+
+    if flow_id in new_flows:
+        new_flows.remove(flow_id)
+
+    table = bfrt.{{prog_name}}.pipe.Ingress.incoming_map
+    for id in new_flows:
+        {% for r in range(registers) %}
+        {% if loop.first %}
+        if (flow_id_idx[id]['reg']) == {{r}}:
+        {% else %}
+        elif (flow_id_idx[id]['reg']) == {{r}}:
+        {% endif %}
+            try:
+                table.entry_with_set_index_{{r}}(flow_id = (id & 0xFFFFFFFF0000) >> 16,
+                                                 flow_idx = id & 0xFFFF,
+                                                 reg_idx=flow_id_idx[id]['idx'],
+                                                 update_idx={{r}},
+                                                 ENTRY_HIT_STATE="ENTRY_ACTIVE").push()
+            except Exception as e:
+                print("Incoming Map Add Error: ", e)
+                logging.error(f"Incoming Map Add Error: {e}")
+
+        {% endfor %}
+
+#Record incoming flows
+def add_incoming_flow(node, flow_id, time):
+    global nodes_incoming
+    if node not in nodes_incoming:
+        nodes_incoming[node] = SortedDict()
+
+    timespan = nodes_incoming[node]
+    timespan.update({time :  flow_id})
+
+#update outgoing flows for an evicted flow
+def update_existing_outgoing(node, flow_id, time):
+    global nodes_outgoing, mapping
+
+    #Check if any flows would be impacted
+    if node in nodes_outgoing:
+        timespan = nodes_outgoing[node]
+        impacted_times = list(timespan.irange(time, time + TIME_WINDOW))
+        impacted_flows = {(timespan[t], t) for t in impacted_times}
+
+        for f, t in impacted_flows:
+            add_outgoing_flow(node, f, t, False)
+
+#Save incoming digest messages
+def handle_flow_report(dev_id, pipe_id, direction, parser_id, session, flow_report):
+    global report_queue
+    for report in flow_report:
+        report_queue.put(report)
+    return 0
+
+#Process incoming flow reports
+def process_flow_reports(report_queue):
+    global incomplete_records, batch_lock, batch_count
+
+    while True:
+
+        report = report_queue.get()
+        
+        with batch_lock:
+            if (batch_count == 0):
+                bfrt.batch_begin()
+            batch_count += 1
+
+        
+        #Unpack the digest
+        flow_id = report["flow_id"]
+        flow_idx = report["flow_idx"]
+        start_time = report["start_time"]
+        src = report["src_addr"]
+        dst = report["dst_addr"]
+
+        evict_id = report["evict_flow_id"]
+        evict_time = report["evict_time"]
+        
+        #Create keys from id and idx
+        evict_key = (evict_id << 16) | flow_idx
+        flow_key = (flow_id << 16) | flow_idx
+
+        #Record evict ID and time
+        if (evict_id != 0):
+            incomplete_records[evict_key] = evict_time
+        
+
+        #Use start time from an evicted entry
+        if flow_key in incomplete_records:
+            old_time = start_time
+            start_time = incomplete_records.pop(flow_key)
+        
+
+        #Update incoming node
+        add_incoming_flow(dst, flow_key, start_time)
+
+        ##Check if the incoming flow affects any outgoing flows
+        update_existing_outgoing(dst, flow_key, start_time)
+
+        #for now assume we want mapping for all src nodes
+        #if src in hosts or src in networks:
+        add_outgoing_flow(src, flow_key, start_time)
+        
+        with batch_lock:
+            batch_count -= 1
+            if (batch_count == 0):
+                bfrt.batch_end()
+
+
+
+#Clear idle entries
+def idle_incoming_map():
+    table = bfrt.{{prog_name}}.pipe.Ingress.incoming_map
+    try:
+        resp = table.get(regex=True, print_ents=False, return_ents=True)
+    except:
+        return
+
+    for entry in resp:
+        flow_key = entry.key[b'meta.flow_stats.flow_id']
+        hit_state = entry.data[b'$ENTRY_HIT_STATE']
+        if hit_state == "ENTRY_IDLE":
+            table.delete(flow_key)
+
+#Clear idle entries
+def idle_outgoing_map():
+    table = bfrt.{{prog_name}}.pipe.Ingress.outgoing_map
+    try:
+        resp = table.get(regex=True, print_ents=False, return_ents=True)
+    except:
+        return
+
+    for entry in resp:
+        flow_key = entry.key[b'meta.flow_stats.flow_id']
+        hit_state = entry.data[b'$ENTRY_HIT_STATE']
+        if hit_state == "ENTRY_IDLE":
+            table.delete(flow_key)
+
+#Clear idle entries
+def poll_thread():
+    global batch_lock, batch_count
+    while(True):
+        bfrt.{{prog_name}}.pipe.Ingress.outgoing_map.operation_hit_state_update()
+        bfrt.{{prog_name}}.pipe.Ingress.incoming_map.operation_hit_state_update()
+
+        idle_inc = threading.Thread(target=idle_incoming_map)
+        idle_out = threading.Thread(target=idle_outgoing_map)
+
+        with batch_lock:
+            if (batch_count == 0):
+                bfrt.batch_begin()
+            batch_count += 1
+
+        idle_inc.start()
+        idle_out.start()
+
+        idle_inc.join()
+        idle_out.join()
+
+        with batch_lock:
+            batch_count -= 1
+            if (batch_count == 0):
+                bfrt.batch_end()
+
+        timeM.sleep(IDLE_TIME)
+
+
+#Setup the ports
+#ADD PORTS FOR YOUR SYSTEM
+table = bfrt.port.port
+
+p4 = bfrt.{{prog_name}}.pipe
+
+#Set idle timeout
+table = p4.Ingress.incoming_map
+table.idle_table_set_poll(True)
+
+table = p4.Ingress.outgoing_map
+table.idle_table_set_poll(True)
+
+#Populate check_size
+table = p4.Ingress.compare_size
+{% for r in range(registers - 1) %}
+{% for tcam_entry in tcam_entrys %}
+entry = table.entry_with_report_pivot(size_diff_{{r}}={{tcam_entry[0]}},
+                                      size_diff_{{r}}_mask={{tcam_entry[1]}},
+                                      map_hit=1).push()
+{% endfor %}
+{% endfor %}
+
+table.set_default_with_NoAction()
+
+#Push sizes in empty registers
+if (SET_INITIAL):
+    {% for r in range(registers) %}
+    table = p4.Ingress.compare_reg_{{r}}
+    {% if loop.first %}
+    table.add(1, (INITIAL_SIZE * ({{r}} + 1)) - 1)
+    {% else %}
+    table.add(0, (INITIAL_SIZE * ({{r}} + 1)) - 1)
+    {% endif %}
+    table.operation_register_sync()
+    {% endfor %}
+    table = p4.Ingress.compare_reg_0
+    for i in range(2, COMPARE_CAPACITY):
+        
+	    table.add(i, INITIAL_SIZE - 1)
+    table.operation_register_sync()
+
+
+#Populate internal nodes
+internal_count = 0
+with open(INTERNAL_HOSTS_FILE) as f:
+    for i, host in enumerate(f):
+        ip_addr = host.strip()
+        p4.Ingress.internal_src_ip.entry_with_set_internal(src_addr = int(ipaddress.IPv4Address(ip_addr))).push()
+        p4.Ingress.internal_dst_ip.entry_with_set_internal(dst_addr = int(ipaddress.IPv4Address(ip_addr))).push()
+
+        internal_count += 1
+
+
+p4.IngressDeparser.report_flow.callback_register(handle_flow_report)
+
+#Start the poll thread to clear registers
+poll_idle = threading.Thread(target=poll_thread)
+if (POLL_STATUS):
+    poll_idle.start()
+
+print("Setup Done!")
+
+process_reports = threading.Thread(target=process_flow_reports, args=(report_queue,))
+process_reports.start()
