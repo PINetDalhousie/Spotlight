@@ -7,7 +7,7 @@
 6. [License](#license)
 
 ## Overview
-Software artifacts for Spotlight: Shining a Light on Pivot Attacks Using In-network Computing. Repo contains data plane code, control plane rules, attack traces, and our host comparison version. Our data and controle plane is written using [Jinja](https://jinja.palletsprojects.com/en/stable/) to allow for parameter variation. Once code is generated from teh templates is can be run on a [Tofino switch](https://github.com/barefootnetworks/Open-Tofino).
+Software artifacts for Spotlight: Shining a Light on Pivot Attacks Using In-network Computing. Repo contains data plane code, control plane rules, attack traces, and our host comparison version. Our data and controle plane is written using [Jinja](https://jinja.palletsprojects.com/en/stable/) to allow for parameter variation. Once code is generated from the templates, it can be run on a [Tofino switch](https://github.com/barefootnetworks/Open-Tofino).
 
 We also provide our attack traces and some support scripts to help reproduce our results.
 
