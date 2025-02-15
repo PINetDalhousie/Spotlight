@@ -104,13 +104,6 @@ if args.control:
         print(f"Compare bfrt template not found at '{args.bfrt_template}'.")
         sys.exit(1)
 
-if args.control:
-    if  not os.path.exists(args.test_template):
-        print(f"Test template not found at '{args.test_template}'.")
-        sys.exit(1)
-    
-
-
 #Create dataplane
 with open(args.p4_template,'r') as f:
     template_txt=f.read()
