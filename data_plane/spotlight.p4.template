@@ -12,7 +12,7 @@
 #define MAP_SIZE 100000
 #define INTERNAL_SIZE 80000
 
-#define REPORT_PORT 140 //Change to correct physical port for your system
+#define REPORT_PORT 2 //Change to correct physical port for your system
 
 #define START_TIME ig_intr_md.ingress_mac_tstamp[41:10]
 
@@ -63,6 +63,15 @@ control Ingress(
                                 hdr.l4_ports.dst_port
                             });
     }
+
+    Register<bit<32>, bit<1>>(1) start_time_reg;
+    RegisterAction<bit<32>, bit<1>, bit<32>>(start_time_reg) get_start_time = {
+        void apply(inout bit<32> value, out bit<32> rv) {
+            value = START_TIME;
+            rv = value;
+        }
+    };
+
 
     size_t update_size; //Holds evicted bytes and moves to comparison storage
     bit<8> update_reg; //Register array to update

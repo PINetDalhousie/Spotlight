@@ -48,6 +48,7 @@ struct FlowReport {
     Flow flow;
     int packet_count;
     uint64_t byte_count;
+    int duration;
     std::vector<uint64_t> timestamps; // List of timestamps for packets
 
     FlowReport() : packet_count(0), byte_count(0), duration(0) {flow_id=getNewID();}
